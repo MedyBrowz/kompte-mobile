@@ -35,7 +35,6 @@ const state = {
   tab: 'dashboard',
   selected: todayIso().slice(0, 7),
   query: '',
-  limit: 100,
   loading: false,
   syncError: false,
   email: '',
@@ -305,7 +304,7 @@ function setSync(text, error = false) {
 function render() {
   if (!state.data) { view.innerHTML = '<p class="empty">Chargement…</p>'; return; }
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === state.tab));
-  $('#fab').hidden = state.tab === 'account';
+  $('#fab').hidden = state.tab !== 'dashboard'; // Transactions : lecture seule
   if (state.tab === 'transactions') renderTransactions();
   else if (state.tab === 'account') renderAccount();
   else renderDashboard();
@@ -333,8 +332,11 @@ function renderDashboard() {
   const ym = state.selected;
   const { income, out, paid, events } = summary(ym);
   const isToday = ym === todayIso().slice(0, 7);
-  const metric = (label, value, color) =>
-    `<div class="metric"><small>${label}</small><b style="color:${color}">${euro(value)}</b></div>`;
+  const today = todayIso();
+  // Seulement ce qui a déjà eu lieu, les 10 plus récentes (le détail est dans Transactions).
+  const done = events.filter((e) => e.due <= today).slice(0, 10);
+  const metric = (label, value, color, id = '') =>
+    `<${id ? `button type="button" id="${id}"` : 'div'} class="metric"><small>${label}</small><b style="color:${color}">${euro(value)}</b></${id ? 'button' : 'div'}>`;
   view.innerHTML = `
     <button type="button" class="hero" id="balance">
       <small>SOLDE ACTUEL</small>
@@ -349,34 +351,66 @@ function renderDashboard() {
     ${isToday ? '' : '<p style="text-align:center;margin:-6px 0 10px"><button type="button" class="chip" id="today">Revenir à aujourd’hui</button></p>'}
     <div class="metrics">
       ${metric('Revenus prévus', income, 'var(--green)')}
-      ${metric('Dépenses prévues', out, 'var(--red)')}
-      ${metric('Reste prévisionnel', income - out, 'var(--orange)')}
+      ${metric('Dépenses prévues ›', out - paid, 'var(--red)', 'upcoming')}
       ${metric('Déjà dépensé', paid, 'var(--text)')}
+      ${metric('Reste prévisionnel', income - out, 'var(--orange)')}
     </div>
-    <h2>Échéances du mois</h2>
-    <div class="list">${events.map(eventRow).join('') || '<p class="empty">Aucune échéance ce mois-ci.</p>'}</div>`;
+    <h2>Dernières opérations</h2>
+    <div class="list">${done.map(eventRow).join('') || '<p class="empty">Aucune opération passée ce mois-ci.</p>'}</div>
+    ${done.length ? '<p class="note">Toutes les opérations du mois : onglet Transactions.</p>' : ''}`;
 }
 
+/** Dépenses qui restent à payer dans le mois (touche sur « Dépenses prévues »). */
+function upcomingSheet() {
+  const today = todayIso();
+  const events = summary(state.selected).events.filter((e) => e.row.kind === 'Dépense' && e.due > today).reverse();
+  const total = events.reduce((sum, e) => sum + e.amount, 0);
+  openSheet(`
+    <h3>Dépenses prévues</h3>
+    <p class="hint" style="text-align:center;margin-top:0">${monthLabel(state.selected)} · encore ${euro(total)} à payer</p>
+    <div class="list" style="margin-top:12px">${events.map(eventRow).join('') || '<p class="empty">Plus aucune dépense prévue ce mois-ci.</p>'}</div>
+    <p class="error-text"></p>
+    <div class="actions"><button type="button" class="primary" data-close>Fermer</button></div>`, async () => {});
+}
+
+/** Toutes les opérations du mois choisi (année puis mois, chacun avec ses flèches). Lecture seule. */
 function renderTransactions() {
+  const ym = state.selected;
+  const { income, out, events } = summary(ym);
   const needle = state.query.toLowerCase();
-  const all = [...state.data.items]
-    .sort((a, b) => (a.first_date < b.first_date ? 1 : a.first_date > b.first_date ? -1 : b.id - a.id))
-    .filter((r) => !needle || r.title.toLowerCase().includes(needle) || r.category.toLowerCase().includes(needle)
-      || amountText(r.total_cents).includes(needle.replace('.', ',')));
-  const rows = all.slice(0, state.limit).map((r) => {
+  const shown = events.filter((e) => !needle || e.row.title.toLowerCase().includes(needle)
+    || e.row.category.toLowerCase().includes(needle) || amountText(e.amount).includes(needle.replace('.', ',')));
+  const rows = shown.map((e) => {
+    const r = e.row;
     const plus = r.kind === 'Revenu';
-    let details = `${r.category} · ${frDate(r.first_date)} · ${r.frequency}`;
-    if (r.installments > 1) details += ` · ${r.installments}x`;
+    let details = `${r.category} · ${frDate(e.due)}`;
+    if (r.id < 0) details += ' · fixe';
+    else if (r.installments > 1) {
+      const index = (+e.due.slice(0, 4) - +r.first_date.slice(0, 4)) * 12 + (+e.due.slice(5, 7) - +r.first_date.slice(5, 7));
+      details += ` · ${index + 1}/${r.installments}`;
+    } else if (r.frequency !== 'Unique') details += ` · ${r.frequency.toLowerCase()}`;
     return `<button type="button" class="row" data-item="${r.id}">
         ${catIcon(r.category)}
         <span class="body"><span class="title">${esc(r.title)}</span><span class="sub">${esc(details)}</span></span>
-        <span class="amount ${plus ? 'plus' : 'minus'}">${plus ? '+' : '−'}${euro(r.total_cents)}</span>
+        <span class="amount ${plus ? 'plus' : 'minus'}">${plus ? '+' : '−'}${euro(e.amount)}</span>
       </button>`;
   }).join('');
+  const month = MONTHS[+ym.slice(5, 7) - 1];
   view.innerHTML = `
-    <input class="search" id="search" type="search" placeholder="Rechercher (description, catégorie, montant)…" value="${esc(state.query)}">
-    <div class="list">${rows || `<p class="empty">${state.query ? 'Aucune transaction trouvée.' : 'Aucune transaction enregistrée.'}</p>`}</div>
-    ${all.length > state.limit ? `<button type="button" class="more" id="more">Afficher plus (${all.length - state.limit} restantes)</button>` : ''}`;
+    <div class="monthbar year">
+      <button type="button" class="icon-btn" data-month="-12" aria-label="Année précédente">‹</button>
+      <span class="label">${ym.slice(0, 4)}</span>
+      <button type="button" class="icon-btn" data-month="12" aria-label="Année suivante">›</button>
+    </div>
+    <div class="monthbar">
+      <button type="button" class="icon-btn" data-month="-1" aria-label="Mois précédent">‹</button>
+      <span class="label">${month[0].toUpperCase() + month.slice(1)}</span>
+      <button type="button" class="icon-btn" data-month="1" aria-label="Mois suivant">›</button>
+    </div>
+    <div class="totals"><span class="plus">+${euro(income)}</span><span class="minus">−${euro(out)}</span>
+      <span>= ${euro(income - out)}</span></div>
+    <input class="search" id="search" type="search" placeholder="Rechercher dans le mois…" value="${esc(state.query)}">
+    <div class="list">${rows || `<p class="empty">${state.query ? 'Aucune opération trouvée.' : 'Aucune opération ce mois-ci.'}</p>`}</div>`;
 }
 
 function renderAccount() {
@@ -590,8 +624,8 @@ document.addEventListener('click', async (event) => {
   if (t.closest('#fab')) { transactionSheet(null); return; }
   if (t.closest('#sync')) { refresh(true); return; }
   if (t.closest('#balance')) { balanceSheet(); return; }
+  if (t.closest('#upcoming')) { upcomingSheet(); return; }
   if (t.closest('#today')) { state.selected = todayIso().slice(0, 7); render(); return; }
-  if (t.closest('#more')) { state.limit += 100; render(); return; }
   if (t.closest('#logout')) {
     if (!confirm('Se déconnecter de Kompte sur ce téléphone ?')) return;
     await sb.auth.signOut();
@@ -618,7 +652,6 @@ document.addEventListener('input', (event) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     state.query = event.target.value.trim();
-    state.limit = 100;
     const pos = event.target.selectionStart;
     render();
     const input = $('#search');

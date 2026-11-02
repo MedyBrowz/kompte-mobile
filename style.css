@@ -57,6 +57,11 @@ h2 { font-size: 18px; margin: 22px 0 10px; }
 
 .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .metric { background: var(--card); border-radius: 12px; padding: 12px 14px; }
+button.metric { border: 1px solid var(--border); text-align: left; width: 100%; }
+button.metric:active { background: var(--input); }
+.monthbar.year { margin-bottom: 4px; }
+.monthbar.year .label { font-size: 26px; }
+.totals { display: flex; justify-content: center; gap: 14px; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
 .metric small { color: var(--muted); font-size: 12px; }
 .metric b { display: block; font-size: 18px; margin-top: 2px; }
 
@@ -86,7 +91,6 @@ h2 { font-size: 18px; margin: 22px 0 10px; }
   width: 100%; margin: 14px 0 10px; padding: 11px 14px; border-radius: 10px;
   border: 0; background: var(--input);
 }
-.more { display: block; margin: 12px auto; border: 0; background: var(--card); border-radius: 10px; padding: 10px 16px; }
 
 .tabs {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 6;
