@@ -420,7 +420,10 @@ function renderAccount() {
       Les modifications faites ici apparaissent sur le PC en quelques secondes, et inversement.</p>
     <p class="note">Les montants fixes, les comptes épargne et les catégories se modifient sur le PC ;
       ils sont pris en compte ici dans les calculs.</p>
-    <div class="actions"><button type="button" class="secondary" id="logout">Se déconnecter</button></div>`;
+    <div class="actions">
+      <button type="button" class="secondary" id="password-change">Changer le mot de passe</button>
+      <button type="button" class="secondary" id="logout">Se déconnecter</button>
+    </div>`;
 }
 
 function renderLogin(message = '') {
@@ -606,6 +609,39 @@ function balanceSheet() {
   });
 }
 
+function passwordSheet() {
+  openSheet(`
+    <h3>Changer le mot de passe</h3>
+    <p class="hint" style="text-align:center">Valable aussi sur le PC.</p>
+    <label class="field" for="p-current">Mot de passe actuel</label>
+    <input class="input" id="p-current" type="password" autocomplete="current-password">
+    <label class="field" for="p-new">Nouveau mot de passe</label>
+    <input class="input" id="p-new" type="password" autocomplete="new-password">
+    <label class="field" for="p-confirm">Confirmer le nouveau mot de passe</label>
+    <input class="input" id="p-confirm" type="password" autocomplete="new-password">
+    <p class="error-text"></p>
+    <div class="actions">
+      <button type="button" class="secondary" data-close>Annuler</button>
+      <button type="submit" class="primary">Changer</button>
+    </div>`, async (form) => {
+    const current = form.querySelector('#p-current').value;
+    const password = form.querySelector('#p-new').value;
+    if (!current || !password) throw new Error('Remplis tous les champs.');
+    if (password.length < 6) throw new Error('Le nouveau mot de passe doit faire au moins 6 caractères.');
+    if (password !== form.querySelector('#p-confirm').value) throw new Error('Les deux nouveaux mots de passe ne correspondent pas.');
+    const { error: authError } = await sb.auth.signInWithPassword({ email: state.email, password: current });
+    if (authError) throw new Error('Le mot de passe actuel est incorrect.');
+    const { error } = await sb.auth.updateUser({ password });
+    if (error) {
+      const text = (error.message || '').toLowerCase();
+      if (text.includes('different')) throw new Error("Le nouveau mot de passe doit être différent de l'ancien.");
+      if (text.includes('least') || text.includes('weak')) throw new Error('Mot de passe trop faible : au moins 6 caractères.');
+      throw new Error(error.message);
+    }
+    toast('Mot de passe changé.');
+  });
+}
+
 let toastTimer = null;
 function toast(text) {
   const el = $('#toast');
@@ -626,6 +662,7 @@ document.addEventListener('click', async (event) => {
   if (t.closest('#balance')) { balanceSheet(); return; }
   if (t.closest('#upcoming')) { upcomingSheet(); return; }
   if (t.closest('#today')) { state.selected = todayIso().slice(0, 7); render(); return; }
+  if (t.closest('#password-change')) { passwordSheet(); return; }
   if (t.closest('#logout')) {
     if (!confirm('Se déconnecter de Kompte sur ce téléphone ?')) return;
     await sb.auth.signOut();
