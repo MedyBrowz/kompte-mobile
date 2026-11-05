@@ -8,7 +8,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/app-192.png">
   <link rel="apple-touch-icon" href="icons/app-192.png">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
   <header class="top">
@@ -17,11 +17,10 @@
   </header>
   <main id="view"></main>
   <nav id="tabs" class="tabs" hidden>
-    <button type="button" data-tab="dashboard">Accueil</button>
+    <button type="button" data-tab="dashboard">Tableau de bord</button>
     <button type="button" data-tab="transactions">Transactions</button>
     <button type="button" data-tab="fixed">Fixes</button>
-    <button type="button" data-tab="forecast">Prévisions</button>
-    <button type="button" data-tab="more">Plus</button>
+    <button type="button" data-tab="account">Compte</button>
   </nav>
   <button id="fab" class="fab" type="button" aria-label="Nouvelle transaction" hidden>+</button>
   <div id="sheet" class="sheet" hidden>
@@ -30,6 +29,6 @@
   </div>
   <div id="toast" class="toast" hidden></div>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>
