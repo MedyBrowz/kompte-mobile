@@ -24,7 +24,7 @@ const DEFAULT_COLORS = {
   Revenus: '#4ADE80', Logement: '#6478D8', Factures: '#EAB308', Alimentation: '#F97316',
   Transport: '#A855F7', 'Véhicule': '#94A3B8', Loisirs: '#22D3EE', Shopping: '#EC4899',
   Abonnements: '#818CF8', 'Santé': '#FB7185', Animaux: '#D4A373', Vacances: '#2DD4BF',
-  Cadeaux: '#F472B6', 'Épargne': '#10B981', Divers: '#9CA3AF',
+  Cadeaux: '#F472B6', 'Épargne': '#10B981', Remboursement: '#A3E635', Divers: '#9CA3AF',
 };
 const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août',
                 'septembre', 'octobre', 'novembre', 'décembre'];
