@@ -300,6 +300,15 @@ function accountBalance(accountId) {
   return account.opening_cents + occurrences('0000-01-01', addDays(todayIso(), 1), accountId).reduce((sum, e) => sum + signed(e), 0);
 }
 
+/** Solde prévu à la fin du mois ym (identique à projected_month_end du PC) ; null pour un mois terminé. */
+function projectedMonthEnd(ym, balance, account = state.account) {
+  if (balance === null) return null;
+  const tomorrow = addDays(todayIso(), 1);
+  const end = periodBounds(ym, monthStart(account))[1];
+  if (end <= tomorrow) return null;
+  return balance + occurrences(tomorrow, end, account).reduce((sum, e) => sum + signed(e), 0);
+}
+
 function getBalance(account = state.account) {
   if (account !== MAIN_ACCOUNT) return accountBalance(account);
   const data = balanceReference();
@@ -459,6 +468,7 @@ function renderDashboard() {
   const ym = state.selected;
   const { income, out, paid, events } = summary(ym);
   const isToday = ym === currentMonth();
+  const projected = projectedMonthEnd(ym, balance);
   const hint = periodHint();
   const today = todayIso();
   // Seulement ce qui a déjà eu lieu, les 10 plus récentes (le détail est dans Transactions).
@@ -470,6 +480,7 @@ function renderDashboard() {
     <button type="button" class="hero" id="balance">
       <small>SOLDE ACTUEL</small>
       <strong>${balance === null ? '— €' : euro(balance)}</strong>
+      ${projected === null ? '' : `<em class="projected">Prévu fin ${MONTHS[+ym.slice(5, 7) - 1]} : <b${projected < 0 ? ' class="neg"' : ''}>${euro(projected)}</b></em>`}
       <span>${state.account !== MAIN_ACCOUNT ? 'Touche pour modifier le compte'
     : ref ? `Depuis le ${frDate(ref.as_of)} · touche pour modifier` : 'Touche ici pour saisir ton solde bancaire actuel'}</span>
     </button>
@@ -484,7 +495,7 @@ function renderDashboard() {
       ${metric('Revenus prévus', income, 'var(--green)')}
       ${metric('Dépenses prévues ›', out - paid, 'var(--red)', 'upcoming')}
       ${metric('Déjà dépensé', paid, 'var(--text)')}
-      ${metric('Reste prévisionnel', income - out, 'var(--orange)')}
+      ${metric('Bilan du mois', income - out, 'var(--orange)')}
     </div>
     <h2>Dernières opérations</h2>
     <div class="list">${done.map(eventRow).join('') || '<p class="empty">Aucune opération passée ce mois-ci.</p>'}</div>
