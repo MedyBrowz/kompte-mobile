@@ -473,16 +473,16 @@ function renderDashboard() {
   const today = todayIso();
   // Seulement ce qui a déjà eu lieu, les 10 plus récentes (le détail est dans Transactions).
   const done = events.filter((e) => e.due <= today).slice(0, 10);
-  const metric = (label, value, color, id = '') =>
-    `<${id ? `button type="button" id="${id}"` : 'div'} class="metric"><small>${label}</small><b style="color:${color}">${euro(value)}</b></${id ? 'button' : 'div'}>`;
+  const metric = (label, value, color, id = '', text = euro(value)) =>
+    `<${id ? `button type="button" id="${id}"` : 'div'} class="metric"><small>${label}</small><b style="color:${color}">${text}</b></${id ? 'button' : 'div'}>`;
+  const result = income - out;
   view.innerHTML = `
     ${accountBar()}
     <button type="button" class="hero" id="balance">
       <small>SOLDE ACTUEL</small>
       <strong>${balance === null ? '— €' : euro(balance)}</strong>
       ${projected === null ? '' : `<em class="projected">Prévu fin ${MONTHS[+ym.slice(5, 7) - 1]} : <b${projected < 0 ? ' class="neg"' : ''}>${euro(projected)}</b></em>`}
-      <span>${state.account !== MAIN_ACCOUNT ? 'Touche pour modifier le compte'
-    : ref ? `Depuis le ${frDate(ref.as_of)} · touche pour modifier` : 'Touche ici pour saisir ton solde bancaire actuel'}</span>
+      ${state.account === MAIN_ACCOUNT && !ref ? '<span>Touche ici pour saisir ton solde bancaire actuel</span>' : ''}
     </button>
     <div class="monthbar">
       <button type="button" class="icon-btn" data-month="-1" aria-label="Mois précédent">‹</button>
@@ -493,9 +493,10 @@ function renderDashboard() {
     ${isToday ? '' : '<p style="text-align:center;margin:-6px 0 10px"><button type="button" class="chip" id="today">Revenir à aujourd’hui</button></p>'}
     <div class="metrics">
       ${metric('Revenus prévus', income, 'var(--green)')}
-      ${metric('Dépenses prévues ›', out - paid, 'var(--red)', 'upcoming')}
+      ${metric('Dépenses prévues ›', out - paid, 'var(--text)', 'upcoming')}
       ${metric('Déjà dépensé', paid, 'var(--text)')}
-      ${metric('Bilan du mois', income - out, 'var(--orange)')}
+      ${metric('Bilan du mois', result, result > 0 ? 'var(--green)' : result < 0 ? 'var(--red)' : 'var(--text)', '',
+        (result > 0 ? '+' : result < 0 ? '−' : '') + euro(Math.abs(result)))}
     </div>
     <h2>Dernières opérations</h2>
     <div class="list">${done.map(eventRow).join('') || '<p class="empty">Aucune opération passée ce mois-ci.</p>'}</div>

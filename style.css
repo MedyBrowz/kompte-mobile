@@ -49,7 +49,7 @@ h2 { font-size: 18px; margin: 22px 0 10px; }
 .hero small { color: var(--muted); font-weight: 700; font-size: 11px; letter-spacing: .6px; }
 .hero strong { display: block; font-size: 34px; margin: 4px 0 2px; }
 .hero span { color: var(--muted); font-size: 12px; }
-.hero .projected { display: block; font-style: normal; color: var(--muted); font-size: 14px; margin: 0 0 6px; }
+.hero .projected { display: block; font-style: normal; color: var(--muted); font-size: 14px; margin: 0; }
 .hero .projected b { color: var(--text); }
 .hero .projected b.neg { color: var(--red); }
 
