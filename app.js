@@ -473,9 +473,11 @@ function renderDashboard() {
   const today = todayIso();
   // Seulement ce qui a déjà eu lieu, les 10 plus récentes (le détail est dans Transactions).
   const done = events.filter((e) => e.due <= today).slice(0, 10);
-  const metric = (label, value, color, id = '', text = euro(value)) =>
-    `<${id ? `button type="button" id="${id}"` : 'div'} class="metric"><small>${label}</small><b style="color:${color}">${text}</b></${id ? 'button' : 'div'}>`;
-  const result = income - out;
+  // Les chiffres du mois se lisent comme un calcul : revenus − dépenses (payées, à venir) = bilan
+  // (même disposition que month_card sur PC).
+  const upcoming = out - paid, result = income - out, scale = Math.max(income, out);
+  const signedText = (value, sign) => (value ? sign : '') + euro(Math.abs(value));
+  const pct = (v) => `${(100 * v / scale).toFixed(2)}%`;
   view.innerHTML = `
     ${accountBar()}
     <button type="button" class="hero" id="balance">
@@ -491,25 +493,25 @@ function renderDashboard() {
     </div>
     ${hint ? `<p class="period">${hint}</p>` : ''}
     ${isToday ? '' : '<p style="text-align:center;margin:-6px 0 10px"><button type="button" class="chip" id="today">Revenir à aujourd’hui</button></p>'}
-    <div class="metrics">
-      ${metric('Revenus prévus', income, 'var(--green)')}
-      ${metric('Dépenses prévues ›', out - paid, 'var(--text)', 'upcoming')}
-      ${metric('Déjà dépensé', paid, 'var(--text)')}
-      ${metric('Bilan du mois', result, result > 0 ? 'var(--green)' : result < 0 ? 'var(--red)' : 'var(--text)', '',
-        (result > 0 ? '+' : result < 0 ? '−' : '') + euro(Math.abs(result)))}
+    <div class="month-card">
+      <div class="mline"><span>Revenus prévus</span><b${income ? ' class="plus"' : ''}>${signedText(income, '+')}</b></div>
+      <div class="mline gap"><span>Déjà dépensé</span><b>${signedText(paid, '−')}</b></div>
+      <button type="button" class="mline" id="upcoming"><span>Dépenses à venir ›</span><b>${signedText(upcoming, '−')}</b></button>
+      ${scale > 0 ? `<div class="mbar"><i style="width:${pct(paid)}"></i><i class="soon" style="width:${pct(upcoming)}"></i></div>` : ''}
+      <div class="mline total"><span>Bilan du mois</span><b class="${result > 0 ? 'plus' : result < 0 ? 'minus' : ''}">${signedText(result, result > 0 ? '+' : '−')}</b></div>
     </div>
     <h2>Dernières opérations</h2>
     <div class="list">${done.map(eventRow).join('') || '<p class="empty">Aucune opération passée ce mois-ci.</p>'}</div>
     ${done.length ? '<p class="note">Toutes les opérations du mois : onglet Transactions.</p>' : ''}`;
 }
 
-/** Dépenses qui restent à payer dans le mois (touche sur « Dépenses prévues »). */
+/** Dépenses qui restent à payer dans le mois (touche sur « Dépenses à venir »). */
 function upcomingSheet() {
   const today = todayIso();
   const events = summary(state.selected).events.filter((e) => e.row.kind === 'Dépense' && e.due > today).reverse();
   const total = events.reduce((sum, e) => sum + e.amount, 0);
   openSheet(`
-    <h3>Dépenses prévues</h3>
+    <h3>Dépenses à venir</h3>
     <p class="hint" style="text-align:center;margin-top:0">${monthLabel(state.selected)} · encore ${euro(total)} à payer</p>
     <div class="list" style="margin-top:12px">${events.map(eventRow).join('') || '<p class="empty">Plus aucune dépense prévue ce mois-ci.</p>'}</div>
     <p class="error-text"></p>

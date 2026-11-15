@@ -59,6 +59,21 @@ h2 { font-size: 18px; margin: 22px 0 10px; }
 .chip { border: 0; background: transparent; color: var(--muted); padding: 6px 4px; }
 
 .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.month-card { background: var(--card); border-radius: 14px; padding: 12px 16px 14px; }
+.mline { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 4px 0;
+  width: 100%; background: none; border: 0; color: inherit; font: inherit; text-align: left; }
+.mline span { color: var(--muted); font-size: 14px; }
+.mline b { font-size: 15px; color: var(--text); white-space: nowrap; }
+.mline.gap { margin-top: 6px; }
+button.mline:active span { color: var(--accent); }
+.mbar { display: flex; height: 8px; background: var(--input); border-radius: 4px; overflow: hidden; margin: 8px 0 2px; }
+.mbar i { background: var(--text); }
+.mbar i.soon { background: var(--muted); }
+.mline.total { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 10px; }
+.mline.total span { color: var(--text); font-weight: 700; font-size: 16px; }
+.mline.total b { font-size: 20px; }
+.mline b.plus { color: var(--green); }
+.mline b.minus { color: var(--red); }
 .metric { background: var(--card); border-radius: 12px; padding: 12px 14px; }
 button.metric { border: 1px solid var(--border); text-align: left; width: 100%; }
 button.metric:active { background: var(--input); }
