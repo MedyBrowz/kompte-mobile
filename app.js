@@ -639,6 +639,7 @@ function tradeSheet(trade = null) {
     return { fresh, gross, row: { instrument_id: pick && pick !== 'new' ? Number(pick) : null, kind, trade_date: day, quantity_e6: quantity,
       price_e6: price, fee_cents: fee, fx_e6: fx, cash_cents: cash } };
   };
+  let rateFor = trade ? currency() : null;
   const layout = () => {
     const kind = get('kind').value, cur = currency(), priced = ['achat', 'vente', 'depart'].includes(kind);
     const shown = { day: true, quantity: priced || kind === 'division', price: priced, fee: priced, fx: priced && cur !== 'EUR',
@@ -647,8 +648,9 @@ function tradeSheet(trade = null) {
     get('new').hidden = get('title').value !== 'new';
     form.querySelector('label[for="t-quantity"]').textContent = kind === 'division' ? 'Multiplicateur (ex. 2 : chaque titre en devient 2)' : 'Quantité';
     form.querySelector('label[for="t-price"]').textContent = `${kind === 'depart' ? 'Prix moyen d’achat' : 'Prix unitaire'} (${cur === 'EUR' ? '€' : cur})`;
-    form.querySelector('label[for="t-fx"]').textContent = `Taux de change : combien de ${cur} pour 1 €`;
-    if (shown.fx && (!get('fx').value || get('fx').value === '1')) { const known = fxAt(cur, todayIso()); get('fx').value = known ? e6Text(known) : ''; }
+    form.querySelector('label[for="t-fx"]').textContent = `Taux : combien de ${cur} pour 1 € (mets 1 si ton prix est en €)`;
+    if (shown.fx && cur !== rateFor) { const known = fxAt(cur, todayIso()); get('fx').value = known ? e6Text(known) : ''; }
+    if (cur.length === 3) rateFor = cur; // proposé seulement quand la devise change, jamais par-dessus une saisie
     let text = '';
     try {
       const { row, gross } = read();
