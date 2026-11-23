@@ -17,7 +17,7 @@ const TABLES = {
   fixed_savings_transfers: ['group_id', 'group_id,account_id'],
   notes: ['id', 'id,item_id,group_id,due_date,body,updated_at'],
   instruments: ['id', 'id,name,kind,isin,ticker,exchange,currency,provider_code'],
-  trades: ['id', 'id,account_id,instrument_id,kind,trade_date,quantity_e6,price_e6,fee_cents,fx_e6,cash_cents'],
+  trades: ['id', 'id,account_id,instrument_id,kind,trade_date,quantity_e6,price_e6,fee_cents,fx_e6,cash_cents,envelope'],
   quotes: ['instrument_id,day', 'instrument_id,day,price_e6,source,fetched_at'],
 };
 const MAIN_ACCOUNT = null; // le compte principal n'a pas de ligne : ses opérations ont account_id null
@@ -44,6 +44,7 @@ const state = {
   selected: todayIso().slice(0, 7),
   query: '',
   period: 'Tout',   // graphique du portefeuille
+  part: 'CTO',      // onglet d'un compte courtier (CTO, PEA, cash)
   category: '',     // filtre de l'onglet Transactions
   loading: false,
   syncError: false,
@@ -344,6 +345,8 @@ function getBalance(account = state.account) {
 // ----------------------------------------------------- bourse (= kompte.py)
 // Quantités, cours et taux : millionièmes entiers (BigInt pour les produits). Taux : unités de devise pour 1 €.
 const E6 = 1000000;
+const BROKER = 'PEA + CTO'; // un courtier : un seul cash, opérations rangées dans le PEA ou le compte-titres
+const COMPARTMENTS = { CTO: 'Compte-titres', PEA: 'PEA' };
 const TRADE_KINDS = { achat: 'Achat', vente: 'Vente', dividende: 'Dividende', frais: 'Frais', impot: 'Impôt',
   division: 'Division de titres', depart: 'Position de départ' };
 const TRADE_RANK = { depart: 0, division: 1, achat: 2, vente: 3 };
@@ -376,8 +379,9 @@ function replayTrades(rows) {
   const ordered = [...rows].sort((a, b) => (a.trade_date < b.trade_date ? -1 : a.trade_date > b.trade_date ? 1 : rank(a) - rank(b) || a.id - b.id));
   for (const t of ordered) {
     if (t.instrument_id === null) continue;
-    if (!positions.has(t.instrument_id)) positions.set(t.instrument_id, { qty: 0, cost: 0, realized: 0, dividends: 0 });
-    const p = positions.get(t.instrument_id), qty = t.quantity_e6;
+    const key = `${t.instrument_id}|${t.envelope}`;
+    if (!positions.has(key)) positions.set(key, { id: t.instrument_id, envelope: t.envelope, qty: 0, cost: 0, realized: 0, dividends: 0 });
+    const p = positions.get(key), qty = t.quantity_e6;
     if (t.kind === 'achat' || t.kind === 'depart') {
       p.qty += qty;
       p.cost += valueCents(qty, t.price_e6, t.fx_e6) + t.fee_cents;
@@ -419,8 +423,8 @@ function portfolio(accountId, day = todayIso()) {
   const { positions, problem } = replayTrades(trades);
   const rows = [];
   let securities = 0, cost = 0;
-  for (const [id, p] of positions) {
-    const instrument = instrumentOf(id), quote = quoteAt(id, day), fx = fxAt(instrument.currency, day);
+  for (const p of positions.values()) {
+    const id = p.id, instrument = instrumentOf(id), quote = quoteAt(id, day), fx = fxAt(instrument.currency, day);
     const known = quote !== null && fx !== null, value = known ? valueCents(p.qty, quote.price_e6, fx) : p.cost;
     if (p.qty) { securities += value; cost += p.cost; }
     rows.push({ ...p, instrument, quote, known, value });
@@ -459,7 +463,8 @@ function portfolioSeries(accountId) {
     for (const [i, v] of prices.get(day) || []) last.set(i, v);
     if (dates.has(day)) positions = replayTrades(trades.filter((t) => t.trade_date <= day)).positions;
     let total = cash;
-    for (const [i, p] of positions) {
+    for (const p of positions.values()) {
+      const i = p.id;
       if (!p.qty) continue;
       const currency = instrumentOf(i).currency, fx = currency === 'EUR' ? E6 : last.get(currencyInstrument(currency));
       total += last.has(i) && fx ? valueCents(p.qty, last.get(i), fx) : p.cost;
@@ -512,7 +517,10 @@ function renderPortfolio() {
   if (days.length) status.push(`Cours de clôture ${days[0] === days[days.length - 1] ? `du ${frDate(days[0])}` : `du ${frDate(days[0])} au ${frDate(days[days.length - 1])}`}, pas en temps réel`);
   if (days.length < quotes.length) status.push('cours saisis à la main');
   const stat = (label, v) => `<div class="mline"><span>${label}</span><b>${euro(v)}</b></div>`;
-  const rows = held.map((r) => {
+  const broker = account.envelope === BROKER, tab = broker ? (['CTO', 'PEA', 'cash'].includes(state.part) ? state.part : 'CTO') : null;
+  const listed = tab ? held.filter((r) => r.envelope === tab) : held;
+  const sum = (list, k) => list.reduce((s, r) => s + r[k], 0);
+  const rows = listed.map((r) => {
     const gain = r.value - r.cost, cur = r.instrument.currency;
     const price = r.quote ? e6Text(r.quote.price_e6, 2) + (cur === 'EUR' ? ' €' : ` ${esc(cur)}`) : 'inconnu';
     const average = r.qty > 0 ? euro(divRound(BigInt(r.cost) * BigInt(E6), r.qty)) : '—';
@@ -522,8 +530,9 @@ function renderPortfolio() {
         <span class="amount right">${euro(r.value)}<small class="${r.known ? gainClass(gain) : ''}">${r.known ? `${gainText(gain)} · ${percentText(gain, r.cost)}` : 'cours inconnu'}</small></span>
       </button>`;
   }).join('');
-  const moves = occurrences('0000-01-01', addDays(todayIso(), 1), account.id).map((e) => ({ day: e.due, label: e.row.title, amount: signed(e), id: null }));
+  const moves = tab && tab !== 'cash' ? [] : occurrences('0000-01-01', addDays(todayIso(), 1), account.id).map((e) => ({ day: e.due, label: e.row.title, amount: signed(e), id: null }));
   for (const t of accountTrades(account.id)) {
+    if (tab && (tab === 'cash' ? !t.cash_cents : t.envelope !== tab)) continue;
     const i = t.instrument_id === null ? null : instrumentOf(t.instrument_id);
     let label = TRADE_KINDS[t.kind] + (i ? ` · ${i.name}` : '');
     if (['achat', 'vente', 'depart'].includes(t.kind)) label += ` · ${e6Text(t.quantity_e6)} × ${e6Text(t.price_e6, 2)}`;
@@ -546,8 +555,12 @@ function renderPortfolio() {
     </div>
     ${status.length ? `<p class="note">${status.join(' · ')}</p>` : ''}
     ${portfolioChart(account.id)}
+    ${broker ? `<div class="parts">${[...Object.entries(COMPARTMENTS), ['cash', 'Espèces']].map(([k, n]) =>
+    `<button type="button" data-part="${k}" class="${k === tab ? 'on' : ''}">${n}<b>${euro(k === 'cash' ? p.cash : sum(held.filter((r) => r.envelope === k), 'value'))}</b></button>`).join('')}</div>` : ''}
+    ${tab === 'cash' ? '' : `${broker && listed.length ? `<div class="month-card" style="margin-top:10px">${stat('Investi', sum(listed, 'cost'))}
+      <div class="mline"><span>Performance</span><b class="${gainClass(sum(listed, 'value') - sum(listed, 'cost'))}">${gainText(sum(listed, 'value') - sum(listed, 'cost'))} · ${percentText(sum(listed, 'value') - sum(listed, 'cost'), sum(listed, 'cost'))}</b></div></div>` : ''}
     <h2>Positions</h2>
-    <div class="list">${rows || '<p class="empty">Aucun titre pour le moment.</p>'}</div>
+    <div class="list">${rows || '<p class="empty">Aucun titre pour le moment.</p>'}</div>`}
     <h2>Historique</h2>
     <div class="list">${moves.slice(0, 60).map((m) => `<${m.id ? `button type="button" data-trade="${m.id}"` : 'div'} class="row">
         <span class="body"><span class="title">${esc(m.label)}</span><span class="sub">${frDate(m.day)}</span></span>
@@ -563,6 +576,7 @@ function checkTrades(rows) {
 
 function tradeSheet(trade = null) {
   const accountId = trade ? trade.account_id : state.account;
+  const broker = state.data.savings_accounts.find((a) => a.id === accountId).envelope === BROKER;
   const instruments = state.data.instruments.filter((i) => i.kind !== 'Devise').sort((a, b) => a.name.localeCompare(b.name, 'fr'));
   const input = (id, label, value, mode = 'decimal') => `<div data-box="${id}"><label class="field" for="t-${id}">${label}</label>
       <input class="input" id="t-${id}" ${id === 'day' ? 'type="date"' : `inputmode="${mode}"`} autocomplete="off" value="${esc(value)}"></div>`;
@@ -570,6 +584,8 @@ function tradeSheet(trade = null) {
     <h3>${trade ? 'Modifier l’opération' : 'Nouvelle opération'}</h3>
     <label class="field" for="t-kind">Type</label>
     <select class="input" id="t-kind">${Object.entries(TRADE_KINDS).map(([k, n]) => `<option value="${k}" ${trade && trade.kind === k ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    ${broker ? `<label class="field" for="t-part">Compartiment</label>
+    <select class="input" id="t-part">${Object.entries(COMPARTMENTS).map(([k, n]) => `<option value="${k}" ${(trade ? trade.envelope : state.part) === k ? 'selected' : ''}>${n}</option>`).join('')}</select>` : ''}
     <label class="field" for="t-title">Titre</label>
     <select class="input" id="t-title"><option value="">Aucun titre</option>${instruments.map((i) =>
     `<option value="${i.id}" ${trade && trade.instrument_id === i.id ? 'selected' : ''}>${esc(i.name)}${i.exchange ? ` · ${esc(i.exchange)}` : ''}</option>`).join('')}<option value="new">+ Nouveau titre…</option></select>
@@ -637,7 +653,7 @@ function tradeSheet(trade = null) {
     const gross = valueCents(quantity, price, fx);
     const cash = { achat: -gross - fee, vente: gross - fee, dividende: amount, frais: -amount, impot: -amount }[kind] || 0;
     return { fresh, gross, row: { instrument_id: pick && pick !== 'new' ? Number(pick) : null, kind, trade_date: day, quantity_e6: quantity,
-      price_e6: price, fee_cents: fee, fx_e6: fx, cash_cents: cash } };
+      price_e6: price, fee_cents: fee, fx_e6: fx, cash_cents: cash, envelope: broker ? get('part').value : '' } };
   };
   let rateFor = trade ? currency() : null;
   const layout = () => {
@@ -1434,7 +1450,7 @@ function accountSheet(account = null) {
     ${isMain ? '' : `<label class="field" for="a-kind">Type de compte</label>
     <select class="input" id="a-kind">${Object.entries(ACCOUNT_KINDS).map(([k, n]) => `<option value="${k}" ${k === (account ? account.kind : 'classique') ? 'selected' : ''}>${n}</option>`).join('')}</select>
     <div id="a-envelope-box"><label class="field" for="a-envelope">Enveloppe</label>
-    <select class="input" id="a-envelope">${['PEA', 'CTO', 'Autre'].map((n) => `<option ${account && account.envelope === n ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
+    <select class="input" id="a-envelope">${['PEA', 'CTO', BROKER, 'Autre'].map((n) => `<option ${account && account.envelope === n ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
     <label class="field" for="a-opening">Solde initial (€)</label>
     <input class="input" id="a-opening" inputmode="decimal" autocomplete="off" value="${account ? amountText(account.opening_cents) : '0'}">`}
     <label class="field" for="a-day">Le mois commence le (1 à 31)</label>
@@ -1461,7 +1477,13 @@ function accountSheet(account = null) {
       }
       const fields = { name, opening_cents: parseAmount(form.querySelector('#a-opening').value), month_start: day, kind,
         envelope: kind === 'investissement' ? form.querySelector('#a-envelope').value : '' };
+      const moving = account && account.envelope !== fields.envelope && accountTrades(account.id).length;
+      if (moving && account.envelope === BROKER) throw new Error('Ce compte contient des opérations PEA et compte-titres : garde « PEA + CTO ».');
       try {
+        // Les compartiments d'abord : recommencer l'enregistrement remet tout en ordre après une coupure.
+        if (moving && fields.envelope === BROKER) {
+          await check(sb.from('trades').update({ envelope: account.envelope === 'PEA' ? 'PEA' : 'CTO' }).eq('account_id', account.id));
+        }
         if (account) await check(sb.from('savings_accounts').update(fields).eq('id', account.id));
         else await check(sb.from('savings_accounts').insert({ id: newId(), ...fields }));
       } catch (e) {
@@ -1583,6 +1605,8 @@ document.addEventListener('click', async (event) => {
   if (t.closest('#add-trade')) { tradeSheet(); return; }
   const period = t.closest('[data-period]');
   if (period) { state.period = period.dataset.period; render(); return; }
+  const part = t.closest('[data-part]');
+  if (part) { state.part = part.dataset.part; render(); return; }
   const tradeRow = t.closest('[data-trade]');
   if (tradeRow) { tradeSheet(state.data.trades.find((x) => x.id === Number(tradeRow.dataset.trade))); return; }
   const held = t.closest('[data-instrument]');

@@ -78,6 +78,11 @@ button.mline:active span { color: var(--accent); }
 .row .amount small { display: block; font-weight: 400; font-size: 11px; color: var(--muted); }
 .row .amount small.plus { color: var(--green); }
 .row .amount small.minus { color: var(--red); }
+.parts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 14px; }
+.parts button { border: 0; border-radius: 12px; background: var(--card); color: var(--muted); padding: 10px 4px; font-size: 13px; }
+.parts button b { display: block; color: var(--text); font-size: 14px; margin-top: 2px; white-space: nowrap; }
+.parts button.on { background: var(--accent); color: #fff; }
+.parts button.on b { color: #fff; }
 .chart { margin-top: 12px; }
 .chart svg { width: 100%; height: 150px; display: block; margin: 8px 0 4px; }
 .chart polyline { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
