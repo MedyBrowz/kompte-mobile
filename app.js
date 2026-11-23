@@ -577,6 +577,102 @@ function renderTransactions() {
 }
 
 /** Montants fixes : on peut en ajouter ici ; les modifier reste sur le PC. */
+function fixedVersions(groupId) {
+  return state.data.fixed_versions.filter((v) => v.group_id === groupId).sort((a, b) => (a.start_month < b.start_month ? -1 : 1));
+}
+function fixedVersionAt(groupId, ym) {
+  return fixedVersions(groupId).filter((v) => v.start_month <= ym && (!v.end_month || v.end_month > ym)).pop() || null;
+}
+/** Mois de fin si le montant fixe est arrêté (= fixed_stopped_since). */
+function fixedStopped(groupId) {
+  const ends = fixedVersions(groupId).map((v) => v.end_month);
+  return ends.length && ends.every(Boolean) ? ends.sort().pop() : null;
+}
+/** Mois de la prochaine échéance, null si arrêté (= fixed_next_month de kompte.py). */
+function fixedNextMonth(groupId, day = null) {
+  const versions = fixedVersions(groupId), today = todayIso();
+  if (!versions.length) return null;
+  let ym = today.slice(0, 7) > versions[0].start_month ? today.slice(0, 7) : versions[0].start_month;
+  for (let i = 0; i < 36; i++) {
+    const v = fixedVersionAt(groupId, ym);
+    if (v && dueInMonth(ym, v.day_of_month) > today && (day === null || dueInMonth(ym, day) > today)) return ym;
+    ym = nextMonth(ym);
+  }
+  return null;
+}
+/** Nouveau montant ou jour à partir du mois `ym`, les mois d'avant restent intacts (= save_fixed).
+    La nouvelle période est écrite en premier : une coupure réseau ne fait jamais disparaître le montant
+    (recommencer l'enregistrement remet tout en ordre). keepStop : garder la fin déjà programmée. */
+async function saveFixedFrom(group, title, amount, day, ym, keepStop) {
+  const versions = fixedVersions(group.id), current = fixedVersionAt(group.id, ym), stopped = fixedStopped(group.id);
+  await check(sb.from('fixed_groups').update({ title, day_of_month: day }).eq('id', group.id));
+  if (current && current.amount_cents === amount && current.day_of_month === day && (!stopped || stopped > ym)) return;
+  await check(sb.from('fixed_versions').insert({ id: newId(), group_id: group.id, amount_cents: amount, start_month: ym,
+    end_month: keepStop && stopped && stopped > ym ? stopped : null, day_of_month: day }));
+  for (const v of versions) {
+    if (v.start_month >= ym) await check(sb.from('fixed_versions').delete().eq('id', v.id));
+    else if (!v.end_month || v.end_month > ym) await check(sb.from('fixed_versions').update({ end_month: ym }).eq('id', v.id));
+  }
+}
+
+function fixedEditSheet(group) {
+  const upcoming = fixedNextMonth(group.id), versions = fixedVersions(group.id);
+  const today = todayIso(), thisMonth = today.slice(0, 7);
+  const current = fixedVersionAt(group.id, upcoming || thisMonth) || versions[versions.length - 1];
+  const my = (ym) => `${ym.slice(5)}/${ym.slice(0, 4)}`;
+  const history = versions.slice().reverse().map((v) => {
+    const active = v.start_month <= thisMonth && (!v.end_month || v.end_month > thisMonth);
+    const period = v.end_month ? `${my(v.start_month)} → ${my(monthShift(v.end_month + '-01', -1).slice(0, 7))}` : `depuis ${my(v.start_month)}`;
+    return `<div class="mline"><span>${period} · le ${v.day_of_month}${v.start_month > thisMonth ? ' · programmé' : ''}</span>
+      <b${active ? '' : ' class="old"'}>${euro(v.amount_cents)}</b></div>`;
+  }).join('') + state.data.fixed_overrides.filter((o) => o.group_id === group.id)
+    .sort((a, b) => (a.month < b.month ? 1 : -1))
+    .map((o) => `<div class="mline"><span>${monthLabel(o.month)} seulement</span><b class="only">${o.amount_cents ? euro(o.amount_cents) : 'aucun'}</b></div>`).join('');
+  openSheet(`
+    <h3>Modifier le montant fixe</h3>
+    <label class="field" for="x-amount">Montant mensuel (€)</label>
+    <input class="input big" id="x-amount" inputmode="decimal" autocomplete="off" value="${current ? amountText(current.amount_cents) : ''}">
+    <label class="field" for="x-title">Description</label>
+    <input class="input" id="x-title" autocomplete="off" value="${esc(group.title)}">
+    <label class="field" for="x-day">Jour du mois (1 à 31)</label>
+    <input class="input" id="x-day" inputmode="numeric" value="${current ? current.day_of_month : group.day_of_month}">
+    ${upcoming ? '<label class="check"><input type="checkbox" id="x-next" checked><span>Changer seulement à partir de la prochaine échéance</span></label>' : ''}
+    <div id="x-start-box"><label class="field" for="x-start">À partir de</label>
+      <input class="input" id="x-start" type="date" value="${(current ? current.start_month : thisMonth)}-01"></div>
+    <p class="hint" id="x-info"></p>
+    <div class="month-card history"><b>Historique</b>${history}</div>
+    <p class="note">Le type, la catégorie, le compte et l’arrêt se changent sur le PC.</p>
+    <p class="error-text"></p>
+    <div class="actions">
+      <button type="button" class="secondary" data-close>Annuler</button>
+      <button type="submit" class="primary">Enregistrer</button>
+    </div>`, async (form) => {
+    const title = form.querySelector('#x-title').value.trim();
+    if (!title) throw new Error('Saisis une description.');
+    const amount = positiveCents(form.querySelector('#x-amount').value);
+    const day = Number(form.querySelector('#x-day').value.trim());
+    if (!Number.isInteger(day) || day < 1 || day > 31) throw new Error('Jour du mois : entre 1 et 31.');
+    const box = form.querySelector('#x-next'), fromNext = !!box && box.checked;
+    const start = form.querySelector('#x-start').value;
+    if (!fromNext && !/^\d{4}-\d{2}-\d{2}$/.test(start)) throw new Error('Date invalide.');
+    const ym = fromNext ? fixedNextMonth(group.id, day) : start.slice(0, 7);
+    if (!ym) throw new Error('Ce montant fixe est arrêté : il n’a plus de prochaine échéance.');
+    await saveFixedFrom(group, title, amount, day, ym, fromNext);
+  });
+  const form = $('#sheet-form');
+  const refreshInfo = () => {
+    const box = form.querySelector('#x-next'), on = !!box && box.checked, day = Number(form.querySelector('#x-day').value);
+    form.querySelector('#x-start-box').hidden = on;
+    const ym = on && Number.isInteger(day) && day >= 1 && day <= 31 ? fixedNextMonth(group.id, day) : null;
+    form.querySelector('#x-info').textContent = ym
+      ? `Le changement s’applique à partir du ${frDate(dueInMonth(ym, day))}. Les échéances passées ne changent pas.`
+      : on ? '' : 'Le montant et le jour s’appliquent à partir de la date choisie.';
+  };
+  form.querySelector('#x-day').addEventListener('input', refreshInfo);
+  if (form.querySelector('#x-next')) form.querySelector('#x-next').addEventListener('change', refreshInfo);
+  refreshInfo();
+}
+
 function renderFixed() {
   const ym = todayIso().slice(0, 7);
   const groups = state.data.fixed_groups.filter((g) => (g.account_id ?? null) === state.account).sort((a, b) => b.id - a.id);
@@ -584,20 +680,20 @@ function renderFixed() {
     const version = state.data.fixed_versions.filter((v) => v.group_id === g.id && v.start_month <= ym
       && (!v.end_month || v.end_month > ym)).sort((a, b) => (a.start_month < b.start_month ? 1 : -1))[0];
     const plus = g.kind === 'Revenu';
-    return `<div class="row">
+    return `<button type="button" class="row" data-fixed="${g.id}">
         ${catIcon(g.category)}
         <span class="body"><span class="title">${esc(g.title)}</span>
           <span class="sub">${esc(g.category)}${version ? ` · le ${version.day_of_month} du mois` : ''}</span></span>
         ${version ? `<span class="amount ${plus ? 'plus' : 'minus'}">${plus ? '+' : '−'}${euro(version.amount_cents)}</span>`
     : '<span class="sub">Pas actif ce mois-ci</span>'}
-      </div>`;
+      </button>`;
   }).join('');
   view.innerHTML = `
     ${accountBar()}
     <h2>Montants fixes</h2>
     <button type="button" class="primary wide" id="add-fixed">+ Ajouter un montant fixe</button>
     <div class="list">${rows || '<p class="empty">Aucun montant fixe enregistré.</p>'}</div>
-    <p class="note">Pour modifier ou arrêter un montant fixe, passe par le PC.</p>`;
+    <p class="note">Touche un montant fixe pour le modifier et voir son historique. Pour l’arrêter, passe par le PC.</p>`;
 }
 
 function renderNotes() {
@@ -872,7 +968,7 @@ function fixedNoteSheet(groupId, due) {
   if (!group) return;
   openSheet(`
     <h3>${esc(group.title)}</h3>
-    <p class="hint" style="text-align:center;margin-top:0">Montant fixe : le montant se modifie sur le PC.</p>
+    <p class="hint" style="text-align:center;margin-top:0">Montant fixe : il se modifie dans l’onglet Fixes.</p>
     ${noteField(-groupId, due)}
     <p class="error-text"></p>
     <div class="actions">
@@ -1107,6 +1203,12 @@ document.addEventListener('click', async (event) => {
   }
   const month = t.closest('[data-month]');
   if (month) { state.selected = monthShift(state.selected + '-01', +month.dataset.month).slice(0, 7); render(); return; }
+  const fixed = t.closest('[data-fixed]');
+  if (fixed) {
+    const group = state.data.fixed_groups.find((g) => g.id === Number(fixed.dataset.fixed));
+    if (group) fixedEditSheet(group);
+    return;
+  }
   const row = t.closest('[data-item]');
   if (row) {
     const id = Number(row.dataset.item);

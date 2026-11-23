@@ -72,6 +72,11 @@ button.mline:active span { color: var(--accent); }
 .mline.total { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 10px; }
 .mline.total span { color: var(--text); font-weight: 700; font-size: 16px; }
 .mline.total b { font-size: 20px; }
+.check { display: flex; align-items: center; gap: 10px; margin: 16px 0 4px; font-size: 14px; }
+.check input { width: 20px; height: 20px; flex: none; accent-color: var(--accent); }
+.history { margin-top: 12px; }
+.mline b.old { color: var(--muted); }
+.mline b.only { color: var(--orange); }
 .mline b.plus { color: var(--green); }
 .mline b.minus { color: var(--red); }
 .metric { background: var(--card); border-radius: 12px; padding: 12px 14px; }
