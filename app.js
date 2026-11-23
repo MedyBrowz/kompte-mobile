@@ -8,7 +8,7 @@ const POLL_MS = 15000;
 const PAGE = 1000;
 
 const TABLES = {
-  savings_accounts: ['id', 'id,name,opening_cents,month_start'],
+  savings_accounts: ['id', 'id,name,opening_cents,month_start,kind,envelope'],
   items: ['id', 'id,title,kind,category,total_cents,first_date,installments,frequency,created_at,account_id'],
   fixed_groups: ['id', 'id,title,category,kind,day_of_month,account_id'],
   fixed_versions: ['id', 'id,group_id,amount_cents,start_month,end_month,day_of_month'],
@@ -16,6 +16,9 @@ const TABLES = {
   savings_transfers: ['item_id', 'item_id,account_id'],
   fixed_savings_transfers: ['group_id', 'group_id,account_id'],
   notes: ['id', 'id,item_id,group_id,due_date,body,updated_at'],
+  instruments: ['id', 'id,name,kind,isin,ticker,exchange,currency,provider_code'],
+  trades: ['id', 'id,account_id,instrument_id,kind,trade_date,quantity_e6,price_e6,fee_cents,fx_e6,cash_cents'],
+  quotes: ['instrument_id,day', 'instrument_id,day,price_e6,source,fetched_at'],
 };
 const MAIN_ACCOUNT = null; // le compte principal n'a pas de ligne : ses opérations ont account_id null
 const ALL_ACCOUNTS = 'tous';
@@ -40,6 +43,7 @@ const state = {
   account: MAIN_ACCOUNT,
   selected: todayIso().slice(0, 7),
   query: '',
+  period: 'Tout',   // graphique du portefeuille
   category: '',     // filtre de l'onglet Transactions
   loading: false,
   syncError: false,
@@ -278,12 +282,15 @@ function summary(ym, account = state.account) {
   const [start, end] = periodBounds(ym, monthStart(account));
   const events = occurrences(start, end, account);
   const today = todayIso();
-  let income = 0, out = 0, paid = 0;
+  // Un virement entre mes comptes n'est ni un revenu ni une dépense.
+  const ids = transferIds();
+  let income = 0, out = 0, paid = 0, transfers = 0;
   for (const e of events) {
+    if (ids.has(e.row.id)) { transfers += signed(e); continue; }
     if (e.row.kind === 'Revenu') income += e.amount;
     else { out += e.amount; if (e.due <= today) paid += e.amount; }
   }
-  return { income, out, paid, events };
+  return { income, out, paid, events, transfers };
 }
 
 const signed = (e) => (e.row.kind === 'Revenu' ? e.amount : -e.amount);
@@ -294,10 +301,13 @@ function balanceReference() {
   return b;
 }
 
-function accountBalance(accountId) {
+/** Solde d'un compte ; pour un compte investissement, c'est son cash (opérations boursières comprises). */
+function accountBalance(accountId, day = todayIso()) {
   const account = state.data.savings_accounts.find((a) => a.id === accountId);
   if (!account) return 0;
-  return account.opening_cents + occurrences('0000-01-01', addDays(todayIso(), 1), accountId).reduce((sum, e) => sum + signed(e), 0);
+  const end = addDays(day, 1);
+  const traded = state.data.trades.reduce((s, t) => s + (t.account_id === accountId && t.trade_date < end ? t.cash_cents : 0), 0);
+  return account.opening_cents + occurrences('0000-01-01', end, accountId).reduce((sum, e) => sum + signed(e), 0) + traded;
 }
 
 /** Solde prévu à la fin du mois ym (identique à projected_month_end du PC) ; null pour un mois terminé. */
@@ -329,6 +339,358 @@ function getBalance(account = state.account) {
     for (const [key, value] of current) if (key.split('|').pop() > anchor) delta += value;
   }
   return +data.balance_cents + delta;
+}
+
+// ----------------------------------------------------- bourse (= kompte.py)
+// Quantités, cours et taux : millionièmes entiers (BigInt pour les produits). Taux : unités de devise pour 1 €.
+const E6 = 1000000;
+const TRADE_KINDS = { achat: 'Achat', vente: 'Vente', dividende: 'Dividende', frais: 'Frais', impot: 'Impôt',
+  division: 'Division de titres', depart: 'Position de départ' };
+const TRADE_RANK = { depart: 0, division: 1, achat: 2, vente: 3 };
+const ACCOUNT_KINDS = { classique: 'Compte classique', epargne: 'Compte épargne', investissement: 'Compte investissement' };
+
+function divRound(numerator, denominator) {
+  const n = BigInt(numerator), d = BigInt(denominator), a = n < 0n ? -n : n;
+  const v = Number((2n * a + d) / (2n * d));
+  return n < 0n ? -v : v;
+}
+function valueCents(quantity, price, fx = E6) { return divRound(BigInt(quantity) * BigInt(price), 10000n * BigInt(fx)); }
+function parseE6(value, label) {
+  const text = String(value).replace(/[\s €']/g, '').replace(',', '.');
+  if (!/^\d{1,9}(\.\d{1,6})?$/.test(text)) throw new Error(`${label} : nombre positif, 6 chiffres après la virgule au maximum.`);
+  const [whole, rest = ''] = text.split('.');
+  const n = Number(whole) * E6 + Number(rest.padEnd(6, '0'));
+  if (n === 0) throw new Error(`${label} : doit être supérieur à zéro.`);
+  return n;
+}
+function e6Text(value, decimals = 0) {
+  const whole = Math.floor(value / E6).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+  const rest = String(value % E6).padStart(6, '0').replace(/0+$/, '').padEnd(decimals, '0');
+  return whole + (rest ? ',' + rest : '');
+}
+function accountTrades(accountId) { return state.data.trades.filter((t) => t.account_id === accountId); }
+function replayTrades(rows) {
+  const positions = new Map();
+  let problem = null;
+  const rank = (t) => TRADE_RANK[t.kind] ?? 4;
+  const ordered = [...rows].sort((a, b) => (a.trade_date < b.trade_date ? -1 : a.trade_date > b.trade_date ? 1 : rank(a) - rank(b) || a.id - b.id));
+  for (const t of ordered) {
+    if (t.instrument_id === null) continue;
+    if (!positions.has(t.instrument_id)) positions.set(t.instrument_id, { qty: 0, cost: 0, realized: 0, dividends: 0 });
+    const p = positions.get(t.instrument_id), qty = t.quantity_e6;
+    if (t.kind === 'achat' || t.kind === 'depart') {
+      p.qty += qty;
+      p.cost += valueCents(qty, t.price_e6, t.fx_e6) + t.fee_cents;
+    } else if (t.kind === 'vente') {
+      if (qty > p.qty && !problem) problem = t;
+      const removed = qty >= p.qty ? p.cost : divRound(BigInt(p.cost) * BigInt(qty), p.qty);
+      p.cost -= removed;
+      p.qty -= qty;
+      p.realized += t.cash_cents - removed;
+    } else if (t.kind === 'division') p.qty = divRound(BigInt(p.qty) * BigInt(qty), E6);
+    else if (t.kind === 'dividende') p.dividends += t.cash_cents;
+  }
+  return { positions, problem };
+}
+function instrumentOf(id) { return state.data.instruments.find((i) => i.id === id); }
+function currencyInstrument(currency) {
+  const found = state.data.instruments.filter((i) => i.kind === 'Devise' && i.ticker === currency).sort((a, b) => a.id - b.id)[0];
+  return found ? found.id : null;
+}
+function quoteAt(id, day) {
+  let best = null;
+  for (const q of state.data.quotes) if (q.instrument_id === id && q.day <= day && (!best || q.day > best.day)) best = q;
+  return best;
+}
+function fxAt(currency, day) {
+  if (currency === 'EUR') return E6;
+  const owner = currencyInstrument(currency), found = owner === null ? null : quoteAt(owner, day);
+  return found ? found.price_e6 : null;
+}
+function transferIds() {
+  return new Set([...state.data.savings_transfers.map((t) => t.item_id), ...state.data.fixed_savings_transfers.map((t) => -t.group_id)]);
+}
+function isInvestment(accountId) {
+  const a = accountId === MAIN_ACCOUNT ? null : state.data.savings_accounts.find((x) => x.id === accountId);
+  return !!a && a.kind === 'investissement';
+}
+function portfolio(accountId, day = todayIso()) {
+  const end = addDays(day, 1), trades = accountTrades(accountId).filter((t) => t.trade_date < end);
+  const { positions, problem } = replayTrades(trades);
+  const rows = [];
+  let securities = 0, cost = 0;
+  for (const [id, p] of positions) {
+    const instrument = instrumentOf(id), quote = quoteAt(id, day), fx = fxAt(instrument.currency, day);
+    const known = quote !== null && fx !== null, value = known ? valueCents(p.qty, quote.price_e6, fx) : p.cost;
+    if (p.qty) { securities += value; cost += p.cost; }
+    rows.push({ ...p, instrument, quote, known, value });
+  }
+  const transfers = transferIds();
+  const moved = occurrences('0000-01-01', end, accountId).filter((e) => transfers.has(e.row.id)).reduce((s, e) => s + signed(e), 0);
+  const started = trades.filter((t) => t.kind === 'depart').reduce((s, t) => s + valueCents(t.quantity_e6, t.price_e6, t.fx_e6) + t.fee_cents, 0);
+  const cash = accountBalance(accountId, day), total = cash + securities;
+  const paidIn = state.data.savings_accounts.find((a) => a.id === accountId).opening_cents + moved + started;
+  rows.sort((a, b) => (a.qty === 0) - (b.qty === 0) || b.value - a.value || a.instrument.id - b.instrument.id);
+  return { cash, securities, total, cost, paidIn, gain: total - paidIn, positions: rows, problem };
+}
+/** [jour, valeur, capital net versé] depuis la première activité (= portfolio_series). */
+function portfolioSeries(accountId) {
+  const today = todayIso(), transfers = transferIds(), events = new Map();
+  const add = (day, value, base) => { if (!events.has(day)) events.set(day, []); events.get(day).push([value, base]); };
+  for (const e of occurrences('0000-01-01', addDays(today, 1), accountId)) add(e.due, signed(e), transfers.has(e.row.id) ? signed(e) : 0);
+  const trades = accountTrades(accountId);
+  for (const t of trades) add(t.trade_date, t.cash_cents, t.kind === 'depart' ? valueCents(t.quantity_e6, t.price_e6, t.fx_e6) + t.fee_cents : 0);
+  if (!events.size) return [];
+  const owned = new Set(trades.filter((t) => t.instrument_id !== null).map((t) => t.instrument_id));
+  const sources = new Set(owned);
+  for (const i of owned) if (instrumentOf(i).currency !== 'EUR') sources.add(currencyInstrument(instrumentOf(i).currency));
+  const prices = new Map();
+  for (const q of state.data.quotes) {
+    if (!sources.has(q.instrument_id)) continue;
+    if (!prices.has(q.day)) prices.set(q.day, []);
+    prices.get(q.day).push([q.instrument_id, q.price_e6]);
+  }
+  const first = [...events.keys()].sort()[0], last = new Map(), dates = new Set(trades.map((t) => t.trade_date));
+  for (const day of [...prices.keys()].filter((d) => d < first).sort()) for (const [i, v] of prices.get(day)) last.set(i, v);
+  let cash = state.data.savings_accounts.find((a) => a.id === accountId).opening_cents, paidIn = cash, positions = new Map();
+  const out = [];
+  for (let day = first; day <= today; day = addDays(day, 1)) {
+    for (const [value, base] of events.get(day) || []) { cash += value; paidIn += base; }
+    for (const [i, v] of prices.get(day) || []) last.set(i, v);
+    if (dates.has(day)) positions = replayTrades(trades.filter((t) => t.trade_date <= day)).positions;
+    let total = cash;
+    for (const [i, p] of positions) {
+      if (!p.qty) continue;
+      const currency = instrumentOf(i).currency, fx = currency === 'EUR' ? E6 : last.get(currencyInstrument(currency));
+      total += last.has(i) && fx ? valueCents(p.qty, last.get(i), fx) : p.cost;
+    }
+    out.push([day, total, paidIn]);
+  }
+  return out;
+}
+function accountTotal(id) { return isInvestment(id) ? portfolio(id).total : accountBalance(id); }
+/** Patrimoine : chaque euro une seule fois. */
+function wealth() { return (getBalance(MAIN_ACCOUNT) || 0) + state.data.savings_accounts.reduce((s, a) => s + accountTotal(a.id), 0); }
+function gainText(v) { return (v > 0 ? '+' : v < 0 ? '−' : '') + euro(Math.abs(v)); }
+function gainClass(v) { return v > 0 ? 'plus' : v < 0 ? 'minus' : ''; }
+function percentText(value, base) {
+  if (base <= 0) return '—';
+  const t = divRound(BigInt(value) * 1000n, base);
+  return `${t > 0 ? '+' : t < 0 ? '−' : ''}${Math.floor(Math.abs(t) / 10)},${Math.abs(t) % 10} %`;
+}
+
+const PERIODS = [['1 j', 1], ['1 sem', 7], ['1 mois', 30], ['3 mois', 91], ['1 an', 365], ['Tout', null]];
+function portfolioChart(accountId) {
+  const series = portfolioSeries(accountId);
+  if (series.length < 2) return '';
+  const offered = PERIODS.filter(([, d]) => d === null || d <= series.length - 1); // périodes réellement couvertes
+  let chosen = offered.find(([n]) => n === state.period) || offered[offered.length - 1];
+  const days = chosen[1], shown = days === null ? series : series.slice(-days - 1);
+  const start = shown[0], end = shown[shown.length - 1], base = days === null ? [0, 0] : start.slice(1);
+  const gain = (end[1] - base[0]) - (end[2] - base[1]);
+  const values = shown.flatMap((r) => r.slice(1));
+  let lo = Math.min(...values), hi = Math.max(...values);
+  const margin = Math.max((hi - lo) / 12, 100); lo -= margin; hi += margin;
+  const W = 340, H = 150, x = (i) => (W * i / (shown.length - 1)).toFixed(1), y = (v) => (H - H * (v - lo) / (hi - lo)).toFixed(1);
+  const path = (k) => shown.map((r, i) => `${x(i)},${y(r[k])}`).join(' ');
+  return `<div class="month-card chart">
+      <div class="periods">${offered.map(([n]) => `<button type="button" data-period="${n}" class="${n === chosen[0] ? 'on' : ''}">${n}</button>`).join('')}</div>
+      <div class="mline"><span>Performance</span><b class="${gainClass(gain)}">${gainText(gain)}</b></div>
+      <div class="mline"><span>Versé</span><b class="old">${gainText(end[2] - base[1])}</b></div>
+      <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Évolution de la valeur et du capital versé" preserveAspectRatio="none">
+        <polyline points="${path(2)}" class="paid"/><polyline points="${path(1)}" class="value"/></svg>
+      <div class="mline"><span>${frDate(start[0])}</span><span>${frDate(end[0])}</span></div>
+      <p class="hint"><i class="dot value"></i>Valeur <i class="dot paid"></i>Capital net versé</p>
+    </div>`;
+}
+
+function renderPortfolio() {
+  const account = state.data.savings_accounts.find((a) => a.id === state.account), p = portfolio(account.id);
+  const held = p.positions.filter((r) => r.qty), quotes = held.map((r) => r.quote).filter(Boolean);
+  const days = quotes.filter((q) => q.source === 'cloture').map((q) => q.day).sort();
+  const status = [];
+  if (days.length) status.push(`Cours de clôture ${days[0] === days[days.length - 1] ? `du ${frDate(days[0])}` : `du ${frDate(days[0])} au ${frDate(days[days.length - 1])}`}, pas en temps réel`);
+  if (days.length < quotes.length) status.push('cours saisis à la main');
+  const stat = (label, v) => `<div class="mline"><span>${label}</span><b>${euro(v)}</b></div>`;
+  const rows = held.map((r) => {
+    const gain = r.value - r.cost, cur = r.instrument.currency;
+    const price = r.quote ? e6Text(r.quote.price_e6, 2) + (cur === 'EUR' ? ' €' : ` ${esc(cur)}`) : 'inconnu';
+    const average = r.qty > 0 ? euro(divRound(BigInt(r.cost) * BigInt(E6), r.qty)) : '—';
+    return `<button type="button" class="row" data-instrument="${r.instrument.id}">
+        <span class="body"><span class="title">${esc(r.instrument.name)}</span>
+          <span class="sub">${e6Text(r.qty)} × ${price} · moyen ${average}</span></span>
+        <span class="amount right">${euro(r.value)}<small class="${r.known ? gainClass(gain) : ''}">${r.known ? `${gainText(gain)} · ${percentText(gain, r.cost)}` : 'cours inconnu'}</small></span>
+      </button>`;
+  }).join('');
+  const moves = occurrences('0000-01-01', addDays(todayIso(), 1), account.id).map((e) => ({ day: e.due, label: e.row.title, amount: signed(e), id: null }));
+  for (const t of accountTrades(account.id)) {
+    const i = t.instrument_id === null ? null : instrumentOf(t.instrument_id);
+    let label = TRADE_KINDS[t.kind] + (i ? ` · ${i.name}` : '');
+    if (['achat', 'vente', 'depart'].includes(t.kind)) label += ` · ${e6Text(t.quantity_e6)} × ${e6Text(t.price_e6, 2)}`;
+    else if (t.kind === 'division') label += ` · × ${e6Text(t.quantity_e6)}`;
+    moves.push({ day: t.trade_date, label, amount: t.cash_cents, id: t.id });
+  }
+  moves.sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0));
+  view.innerHTML = `
+    ${accountBar()}
+    <button type="button" class="hero" id="balance">
+      <small>VALEUR TOTALE${account.envelope ? ` · ${esc(account.envelope)}` : ''}</small>
+      <strong>${euro(p.total)}</strong>
+      <em class="projected"><b class="${gainClass(p.gain)}">${gainText(p.gain)} · ${percentText(p.gain, p.paidIn)}</b> sur ce que tu as versé</em>
+    </button>
+    ${p.problem ? '<p class="error-text">⚠ Une vente dépasse la quantité détenue : corrige-la dans l’historique.</p>' : ''}
+    <div class="month-card" style="margin-top:10px">${stat('Cash disponible', p.cash)}${stat('Titres', p.securities)}${stat('Investi (prix de revient)', p.cost)}${stat('Capital net versé', p.paidIn)}</div>
+    <div class="actions" style="margin-top:12px">
+      <button type="button" class="primary" id="add-trade">+ Opération</button>
+      <button type="button" class="secondary" id="transfer">Virement</button>
+    </div>
+    ${status.length ? `<p class="note">${status.join(' · ')}</p>` : ''}
+    ${portfolioChart(account.id)}
+    <h2>Positions</h2>
+    <div class="list">${rows || '<p class="empty">Aucun titre pour le moment.</p>'}</div>
+    <h2>Historique</h2>
+    <div class="list">${moves.slice(0, 60).map((m) => `<${m.id ? `button type="button" data-trade="${m.id}"` : 'div'} class="row">
+        <span class="body"><span class="title">${esc(m.label)}</span><span class="sub">${frDate(m.day)}</span></span>
+        <span class="amount ${m.id ? '' : gainClass(m.amount)}">${m.amount ? gainText(m.amount) : '—'}</span></${m.id ? 'button' : 'div'}>`).join('') || '<p class="empty">Aucune opération.</p>'}</div>
+    <p class="note">Suivi uniquement, aucun ordre n’est passé. La recherche de titres et les cours automatiques se font sur le PC.</p>`;
+}
+
+/** Contrôle d'une suite d'opérations avant l'envoi : une vente ne dépasse jamais la quantité détenue. */
+function checkTrades(rows) {
+  const { problem } = replayTrades(rows);
+  if (problem) throw new Error(`La vente du ${frDate(problem.trade_date)} dépasserait la quantité détenue à cette date.`);
+}
+
+function tradeSheet(trade = null) {
+  const accountId = trade ? trade.account_id : state.account;
+  const instruments = state.data.instruments.filter((i) => i.kind !== 'Devise').sort((a, b) => a.name.localeCompare(b.name, 'fr'));
+  const input = (id, label, value, mode = 'decimal') => `<div data-box="${id}"><label class="field" for="t-${id}">${label}</label>
+      <input class="input" id="t-${id}" ${id === 'day' ? 'type="date"' : `inputmode="${mode}"`} autocomplete="off" value="${esc(value)}"></div>`;
+  openSheet(`
+    <h3>${trade ? 'Modifier l’opération' : 'Nouvelle opération'}</h3>
+    <label class="field" for="t-kind">Type</label>
+    <select class="input" id="t-kind">${Object.entries(TRADE_KINDS).map(([k, n]) => `<option value="${k}" ${trade && trade.kind === k ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    <label class="field" for="t-title">Titre</label>
+    <select class="input" id="t-title"><option value="">Aucun titre</option>${instruments.map((i) =>
+    `<option value="${i.id}" ${trade && trade.instrument_id === i.id ? 'selected' : ''}>${esc(i.name)}${i.exchange ? ` · ${esc(i.exchange)}` : ''}</option>`).join('')}<option value="new">+ Nouveau titre…</option></select>
+    <div id="t-new" hidden>
+      <label class="field" for="t-name">Nom du titre</label><input class="input" id="t-name" autocomplete="off">
+      <label class="field" for="t-type">Nature</label><select class="input" id="t-type"><option>ETF</option><option>Action</option><option>Fonds</option><option>Obligation</option><option>Autre</option></select>
+      <label class="field" for="t-isin">ISIN (facultatif)</label><input class="input" id="t-isin" autocomplete="off" autocapitalize="characters">
+      <label class="field" for="t-currency">Devise</label><input class="input" id="t-currency" autocomplete="off" autocapitalize="characters" value="EUR" maxlength="3">
+    </div>
+    ${input('day', 'Date', trade ? trade.trade_date : todayIso())}
+    ${input('quantity', 'Quantité', trade && trade.quantity_e6 ? e6Text(trade.quantity_e6) : '')}
+    ${input('price', 'Prix unitaire', trade && trade.price_e6 ? e6Text(trade.price_e6) : '')}
+    ${input('fx', 'Taux de change', trade ? e6Text(trade.fx_e6) : '')}
+    ${input('fee', 'Frais (€)', trade ? amountText(trade.fee_cents) : '0')}
+    ${input('amount', 'Montant (€)', trade ? amountText(Math.abs(trade.cash_cents)) : '')}
+    <p class="hint" id="t-info"></p>
+    <p class="error-text"></p>
+    <div class="actions">
+      ${trade ? '<button type="button" class="secondary danger" id="t-delete">Supprimer</button>' : ''}
+      <button type="button" class="secondary" data-close>Annuler</button>
+      <button type="submit" class="primary">Enregistrer</button>
+    </div>`, async (form) => {
+    const d = read();
+    const out = d.row.cash_cents < 0 ? -d.row.cash_cents : 0;
+    const cash = accountBalance(accountId) - (trade ? trade.cash_cents : 0);
+    if (out > cash && !confirm(`Il n’y a que ${euro(cash)} de cash sur ce compte. Enregistrer quand même ?`)) throw new Error('Opération non enregistrée.');
+    const id = trade ? trade.id : newId();
+    let created = null;
+    if (d.fresh) {
+      const same = d.fresh.isin && state.data.instruments.find((i) => i.isin === d.fresh.isin && i.exchange === '');
+      created = same ? null : { id: newId(), ticker: '', exchange: '', provider_code: '', ...d.fresh };
+      d.row.instrument_id = same ? same.id : created.id;
+    }
+    const row = { id, account_id: accountId, ...d.row };
+    checkTrades([...accountTrades(accountId).filter((t) => t.id !== id), row]);
+    if (created) await check(sb.from('instruments').insert(created));
+    // Une opération = une ligne : le cash et la position changent ensemble.
+    if (trade) await check(sb.from('trades').update(d.row).eq('id', id));
+    else await check(sb.from('trades').insert(row));
+  });
+  const form = $('#sheet-form'), get = (id) => form.querySelector(`#t-${id}`);
+  const currency = () => {
+    if (get('title').value === 'new') return get('currency').value.trim().toUpperCase() || 'EUR';
+    return get('title').value ? instrumentOf(Number(get('title').value)).currency : 'EUR';
+  };
+  const read = () => {
+    const kind = get('kind').value, pick = get('title').value, priced = ['achat', 'vente', 'depart'].includes(kind);
+    if (!pick && kind !== 'frais' && kind !== 'impot') throw new Error('Choisis un titre.');
+    let fresh = null;
+    if (pick === 'new') {
+      fresh = { name: get('name').value.trim(), kind: get('type').value, isin: get('isin').value.trim().toUpperCase(), currency: currency() };
+      if (!fresh.name) throw new Error('Le nom du titre est obligatoire.');
+      if (fresh.isin && !/^[A-Z]{2}[A-Z0-9]{9}\d$/.test(fresh.isin)) throw new Error('ISIN : 12 caractères, par exemple FR0000120271.');
+      if (!/^[A-Z]{3}$/.test(fresh.currency)) throw new Error('Devise : trois lettres (EUR, USD…).');
+    }
+    const day = get('day').value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Date invalide.');
+    if (day > todayIso()) throw new Error('La date ne peut pas être dans le futur.');
+    const quantity = priced || kind === 'division' ? parseE6(get('quantity').value, priced ? 'Quantité' : 'Multiplicateur') : 0;
+    const price = priced ? parseE6(get('price').value, 'Prix') : 0;
+    const fx = priced && currency() !== 'EUR' ? parseE6(get('fx').value, 'Taux de change') : E6;
+    const fee = priced ? parseAmount(get('fee').value || '0') : 0;
+    if (fee < 0) throw new Error('Les frais ne peuvent pas être négatifs.');
+    const amount = ['dividende', 'frais', 'impot'].includes(kind) ? positiveCents(get('amount').value) : 0;
+    const gross = valueCents(quantity, price, fx);
+    const cash = { achat: -gross - fee, vente: gross - fee, dividende: amount, frais: -amount, impot: -amount }[kind] || 0;
+    return { fresh, gross, row: { instrument_id: pick && pick !== 'new' ? Number(pick) : null, kind, trade_date: day, quantity_e6: quantity,
+      price_e6: price, fee_cents: fee, fx_e6: fx, cash_cents: cash } };
+  };
+  const layout = () => {
+    const kind = get('kind').value, cur = currency(), priced = ['achat', 'vente', 'depart'].includes(kind);
+    const shown = { day: true, quantity: priced || kind === 'division', price: priced, fee: priced, fx: priced && cur !== 'EUR',
+      amount: ['dividende', 'frais', 'impot'].includes(kind) };
+    for (const [key, on] of Object.entries(shown)) form.querySelector(`[data-box="${key}"]`).hidden = !on;
+    get('new').hidden = get('title').value !== 'new';
+    form.querySelector('label[for="t-quantity"]').textContent = kind === 'division' ? 'Multiplicateur (ex. 2 : chaque titre en devient 2)' : 'Quantité';
+    form.querySelector('label[for="t-price"]').textContent = `${kind === 'depart' ? 'Prix moyen d’achat' : 'Prix unitaire'} (${cur === 'EUR' ? '€' : cur})`;
+    form.querySelector('label[for="t-fx"]').textContent = `Taux de change : combien de ${cur} pour 1 €`;
+    if (shown.fx && (!get('fx').value || get('fx').value === '1')) { const known = fxAt(cur, todayIso()); get('fx').value = known ? e6Text(known) : ''; }
+    let text = '';
+    try {
+      const { row, gross } = read();
+      text = kind === 'depart' ? `Titre déjà détenu : le cash ne bouge pas, ${euro(gross + row.fee_cents)} comptent comme déjà versés.`
+        : kind === 'division' ? 'La quantité change, le coût total reste le même.'
+          : row.cash_cents < 0 ? `${euro(-row.cash_cents)} seront retirés du cash.` : `${euro(row.cash_cents)} rejoindront le cash.`;
+    } catch (e) { /* saisie en cours */ }
+    get('info').textContent = text;
+  };
+  form.oninput = layout;
+  form.onchange = layout;
+  layout();
+  const del = get('delete');
+  if (del) {
+    del.addEventListener('click', async () => {
+      if (!confirm('Supprimer cette opération ?')) return;
+      try {
+        checkTrades(accountTrades(accountId).filter((t) => t.id !== trade.id));
+        await check(sb.from('trades').delete().eq('id', trade.id));
+        closeSheet();
+        await refresh(true);
+      } catch (e) { form.querySelector('.error-text').textContent = e.message; }
+    });
+  }
+}
+
+/** Cours saisi à la main (secours). */
+function quoteSheet(instrument) {
+  const last = quoteAt(instrument.id, todayIso());
+  openSheet(`
+    <h3>${esc(instrument.name)}</h3>
+    <p class="hint" style="text-align:center">${[instrument.isin, instrument.ticker, instrument.exchange, instrument.currency].filter(Boolean).map(esc).join(' · ')}</p>
+    <p class="note">${last ? `Dernier cours : ${e6Text(last.price_e6, 2)} (${last.source === 'manuel' ? 'saisi à la main' : 'clôture'}, ${frDate(last.day)})` : 'Aucun cours connu.'}</p>
+    <label class="field" for="q-price">Cours du jour, à la main (${esc(instrument.currency)})</label>
+    <input class="input big" id="q-price" inputmode="decimal" autocomplete="off">
+    <p class="error-text"></p>
+    <div class="actions"><button type="button" class="secondary" data-close>Annuler</button><button type="submit" class="primary">Enregistrer</button></div>`,
+  async (form) => {
+    const price = parseE6(form.querySelector('#q-price').value, 'Cours');
+    await check(sb.from('quotes').upsert({ instrument_id: instrument.id, day: todayIso(), price_e6: price, source: 'manuel',
+      fetched_at: new Date().toISOString().slice(0, 16).replace('T', ' ') }, { onConflict: 'instrument_id,day' }));
+  });
 }
 
 // ------------------------------------------------------------ données
@@ -426,15 +788,16 @@ function setSync(text, error = false) {
 function render() {
   if (!state.data) { view.innerHTML = '<p class="empty">Chargement…</p>'; return; }
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === state.tab));
-  $('#fab').hidden = state.tab !== 'dashboard'; // Transactions : lecture seule
   if (state.account !== MAIN_ACCOUNT && !state.data.savings_accounts.some((a) => a.id === state.account)) {
     state.account = MAIN_ACCOUNT; // compte supprimé depuis le PC
     state.selected = currentMonth();
   }
+  $('#fab').hidden = state.tab !== 'dashboard' || isInvestment(state.account); // Transactions : lecture seule
   if (state.tab === 'transactions') renderTransactions();
   else if (state.tab === 'fixed') renderFixed();
   else if (state.tab === 'notes') renderNotes();
   else if (state.tab === 'account') renderAccount();
+  else if (isInvestment(state.account)) renderPortfolio();
   else renderDashboard();
 }
 
@@ -466,7 +829,7 @@ function renderDashboard() {
   const balance = getBalance();
   const ref = balanceReference();
   const ym = state.selected;
-  const { income, out, paid, events } = summary(ym);
+  const { income, out, paid, events, transfers } = summary(ym);
   const isToday = ym === currentMonth();
   const projected = projectedMonthEnd(ym, balance);
   const hint = periodHint();
@@ -485,6 +848,7 @@ function renderDashboard() {
       <strong>${balance === null ? '— €' : euro(balance)}</strong>
       ${projected === null ? '' : `<em class="projected">Prévu fin ${MONTHS[+ym.slice(5, 7) - 1]} : <b${projected < 0 ? ' class="neg"' : ''}>${euro(projected)}</b></em>`}
       ${state.account === MAIN_ACCOUNT && !ref ? '<span>Touche ici pour saisir ton solde bancaire actuel</span>' : ''}
+      ${state.account === MAIN_ACCOUNT && state.data.savings_accounts.length ? `<em class="projected">Patrimoine total : <b>${euro(wealth())}</b></em>` : ''}
     </button>
     <div class="monthbar">
       <button type="button" class="icon-btn" data-month="-1" aria-label="Mois précédent">‹</button>
@@ -499,6 +863,7 @@ function renderDashboard() {
       <button type="button" class="mline" id="upcoming"><span>Dépenses à venir ›</span><b>${signedText(upcoming, '−')}</b></button>
       ${scale > 0 ? `<div class="mbar"><i style="width:${pct(paid)}"></i><i class="soon" style="width:${pct(upcoming)}"></i></div>` : ''}
       <div class="mline total"><span>Bilan du mois</span><b class="${result > 0 ? 'plus' : result < 0 ? 'minus' : ''}">${signedText(result, result > 0 ? '+' : '−')}</b></div>
+      ${transfers ? `<div class="mline"><span>Virements entre mes comptes</span><b class="old">${gainText(transfers)}</b></div>` : ''}
     </div>
     <h2>Dernières opérations</h2>
     <div class="list">${done.map(eventRow).join('') || '<p class="empty">Aucune opération passée ce mois-ci.</p>'}</div>
@@ -508,7 +873,8 @@ function renderDashboard() {
 /** Dépenses qui restent à payer dans le mois (touche sur « Dépenses à venir »). */
 function upcomingSheet() {
   const today = todayIso();
-  const events = summary(state.selected).events.filter((e) => e.row.kind === 'Dépense' && e.due > today).reverse();
+  const ids = transferIds();
+  const events = summary(state.selected).events.filter((e) => e.row.kind === 'Dépense' && e.due > today && !ids.has(e.row.id)).reverse();
   const total = events.reduce((sum, e) => sum + e.amount, 0);
   openSheet(`
     <h3>Dépenses à venir</h3>
@@ -716,8 +1082,8 @@ function renderNotes() {
 }
 
 function renderAccount() {
-  const line = (id, name, balance, day) => `<button type="button" class="row" data-account="${id}">
-      <span class="body"><span class="title">${esc(name)}</span><span class="sub">Le mois commence le ${day}</span></span>
+  const line = (id, name, balance, day, detail = '') => `<button type="button" class="row" data-account="${id}">
+      <span class="body"><span class="title">${esc(name)}</span><span class="sub">${detail || `Le mois commence le ${day}`}</span></span>
       <span class="amount ${balance !== null && balance < 0 ? 'minus' : 'plus'}">${balance === null ? '—' : euro(balance)}</span>
     </button>`;
   const main = mainAccount();
@@ -727,14 +1093,19 @@ function renderAccount() {
       <button type="button" class="primary" id="add-account">+ Ajouter</button>
       <button type="button" class="secondary" id="transfer">Virement</button>
     </div>
+    ${state.data.savings_accounts.length ? `<p class="note" style="font-size:15px">Patrimoine total : <b>${euro(wealth())}</b></p>` : ''}
     <div class="list" style="margin-top:12px">
       ${line('main', main.name, getBalance(MAIN_ACCOUNT), main.month_start)}
-      ${sortedAccounts().map((a) => line(a.id, a.name, accountBalance(a.id), a.month_start)).join('')}
+      ${sortedAccounts().map((a) => {
+    if (!isInvestment(a.id)) return line(a.id, a.name, accountBalance(a.id), a.month_start);
+    const p = portfolio(a.id);
+    return line(a.id, a.name, p.total, a.month_start, `${esc(a.envelope || 'Investissement')} · cash ${euro(p.cash)} · titres ${euro(p.securities)}`);
+  }).join('')}
     </div>
     <h2>Connexion</h2>
     <p class="note" style="margin-top:0">Connecté avec ${esc(state.email)}.<br>
       Les modifications faites ici apparaissent sur le PC en quelques secondes, et inversement.</p>
-    <p class="note">La modification des montants fixes et les catégories se font sur le PC ;
+    <p class="note">Les catégories se modifient sur le PC ;
       ils sont pris en compte ici dans les calculs.</p>
     <div class="actions">
       <button type="button" class="secondary" id="password-change">Changer le mot de passe</button>
@@ -763,6 +1134,8 @@ function renderLogin(message = '') {
 function openSheet(html, onSubmit) {
   const form = $('#sheet-form');
   form.innerHTML = html;
+  form.oninput = null;
+  form.onchange = null;
   $('#sheet').hidden = false;
   form.onsubmit = async (event) => {
     event.preventDefault();
@@ -1056,7 +1429,11 @@ function accountSheet(account = null) {
     <h3>${isMain ? 'Compte principal' : account ? 'Modifier le compte' : 'Nouveau compte'}</h3>
     <label class="field" for="a-name">Nom du compte</label>
     <input class="input" id="a-name" autocomplete="off" value="${current ? esc(current.name) : ''}">
-    ${isMain ? '' : `<label class="field" for="a-opening">Solde initial (€)</label>
+    ${isMain ? '' : `<label class="field" for="a-kind">Type de compte</label>
+    <select class="input" id="a-kind">${Object.entries(ACCOUNT_KINDS).map(([k, n]) => `<option value="${k}" ${k === (account ? account.kind : 'classique') ? 'selected' : ''}>${n}</option>`).join('')}</select>
+    <div id="a-envelope-box"><label class="field" for="a-envelope">Enveloppe</label>
+    <select class="input" id="a-envelope">${['PEA', 'CTO', 'Autre'].map((n) => `<option ${account && account.envelope === n ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
+    <label class="field" for="a-opening">Solde initial (€)</label>
     <input class="input" id="a-opening" inputmode="decimal" autocomplete="off" value="${account ? amountText(account.opening_cents) : '0'}">`}
     <label class="field" for="a-day">Le mois commence le (1 à 31)</label>
     <input class="input" id="a-day" inputmode="numeric" value="${current ? current.month_start : 1}">
@@ -1076,7 +1453,12 @@ function accountSheet(account = null) {
     if (isMain) {
       await check(sb.from('kv_settings').upsert({ key: 'main_account', value: { name, month_start: day } }, { onConflict: 'user_id,key' }));
     } else {
-      const fields = { name, opening_cents: parseAmount(form.querySelector('#a-opening').value), month_start: day };
+      const kind = form.querySelector('#a-kind').value;
+      if (account && kind !== 'investissement' && accountTrades(account.id).length) {
+        throw new Error('Ce compte contient des opérations boursières : il doit rester un compte investissement.');
+      }
+      const fields = { name, opening_cents: parseAmount(form.querySelector('#a-opening').value), month_start: day, kind,
+        envelope: kind === 'investissement' ? form.querySelector('#a-envelope').value : '' };
       try {
         if (account) await check(sb.from('savings_accounts').update(fields).eq('id', account.id));
         else await check(sb.from('savings_accounts').insert({ id: newId(), ...fields }));
@@ -1086,6 +1468,16 @@ function accountSheet(account = null) {
     }
     pendingMonthReset = true;
   });
+  const kindSelect = $('#sheet-form').querySelector('#a-kind');
+  if (kindSelect) {
+    const showEnvelope = () => {
+      const invest = kindSelect.value === 'investissement';
+      $('#sheet-form').querySelector('#a-envelope-box').hidden = !invest;
+      $('#sheet-form').querySelector('label[for="a-opening"]').textContent = invest ? 'Cash de départ (€), sans les titres' : 'Solde initial (€)';
+    };
+    kindSelect.addEventListener('change', showEnvelope);
+    showEnvelope();
+  }
   const del = $('#sheet-form').querySelector('#a-delete');
   if (del) {
     del.addEventListener('click', async () => {
@@ -1186,6 +1578,13 @@ document.addEventListener('click', async (event) => {
     else accountSheet(state.data.savings_accounts.find((a) => a.id === state.account));
     return;
   }
+  if (t.closest('#add-trade')) { tradeSheet(); return; }
+  const period = t.closest('[data-period]');
+  if (period) { state.period = period.dataset.period; render(); return; }
+  const tradeRow = t.closest('[data-trade]');
+  if (tradeRow) { tradeSheet(state.data.trades.find((x) => x.id === Number(tradeRow.dataset.trade))); return; }
+  const held = t.closest('[data-instrument]');
+  if (held) { quoteSheet(instrumentOf(Number(held.dataset.instrument))); return; }
   if (t.closest('#add-account')) { accountSheet(); return; }
   if (t.closest('#transfer')) { transferSheet(); return; }
   if (t.closest('#upcoming')) { upcomingSheet(); return; }
